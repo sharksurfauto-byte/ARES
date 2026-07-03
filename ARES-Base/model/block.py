@@ -52,7 +52,7 @@ class TransformerBlock(nn.Module):
 
         #FFN (MLP)
         residual=hidden_states
-        hidden_states=self.mlp(hidden_states)
+        hidden_states=self.ln2(hidden_states)
         mlp_outputs=self.mlp(hidden_states)
         hidden_states=residual+mlp_outputs
 

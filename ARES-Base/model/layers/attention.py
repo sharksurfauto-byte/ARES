@@ -76,7 +76,7 @@ class CausalSelfAttention(nn.Module):
             #apply causal mask
             query_length,key_length = q.size(-2),k.size(-2)
             #slice the causal mask to the current seq len
-            causal_mask=self.bias[:,:,key_length-query_length:key_length, :key_length]
+            causal_mask=self.bias[:,:,key_length-query_length:key_length, :key_length] #type: ignore
             #mask future tokens
             attn_weights.masked_fill(causal_mask==0, float('-inf'))
 
