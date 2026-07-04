@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from model.config import ARESConfig
 from typing import Optional, Tuple, List
-from block import TransformerBlock
+from model.block import TransformerBlock
 from model.layers.embeddings import TokenEmbedding
 from model.layers.positional_embedding import PositionalEmbedding
 
@@ -47,7 +47,7 @@ class TransformerStack(nn.Module):
                 past_len+T,
                 dtype=torch.long,
                 device=device
-            ).unsqueeze(0)
+            ).unsqueeze(0) # Shape (1, T), will broadcast to (B, T)
         #combine token and pos embed: E=E_token+ E_pos
         inputs_embeds = self.wte(input_ids)
         position_embeds = self.wpe(position_ids)
@@ -66,7 +66,8 @@ class TransformerStack(nn.Module):
             )
 
             if use_cache:
-                presents.append(present) 
+                presents.append(present)  #type: ignore
+
         hidden_states=self.ln_f(hidden_states)
 
         return hidden_states
