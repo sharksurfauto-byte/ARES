@@ -39,7 +39,7 @@ class ARESEvaluator:
             input_ids=batch['input_ids'].to(self.device)
             labels=batch['labels'].to(self.device)
 
-            logits,loss=self.model(input_ids=input_ids, labels=labels, use_cache=False)
+            logits,loss,_=self.model(input_ids=input_ids, labels=labels, use_cache=False)
 
             acc = EvaluationMetrics.compute_token_accuracy(
                 logits=logits, 

@@ -12,7 +12,7 @@ class EvaluationMetrics:
     )->float:
         #returns percentage of correctly predicted tokens
         shift_logits=logits[...,:-1,:].contiguous()
-        shift_labels=labels[...,:1:].contiguous()
+        shift_labels=labels[...,1:].contiguous()
 
         predictions=torch.argmax(shift_logits,dim=-1)
 
@@ -35,7 +35,7 @@ class EvaluationMetrics:
     )->float:
         #compute mean cross entropy loss over valid seq tokens
         shift_logits=logits[...,:-1,:].contiguous()
-        shift_labels=labels[...,:1:].contiguous()
+        shift_labels=labels[...,1:].contiguous()
 
         loss_fct=nn.CrossEntropyLoss(ignore_index=ignore_index, reduction="mean")
         loss=loss_fct(
