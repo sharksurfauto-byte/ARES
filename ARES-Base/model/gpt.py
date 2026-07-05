@@ -4,6 +4,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, List, Dict, Any
 from model.config import ARESConfig
 from model.transformer import TransformerStack
+from utils.hooks import HookRegistry
 
 class ARESBaseModel(nn.Module):
     def __init__(self, config:ARESConfig):
@@ -48,13 +49,14 @@ class ARESBaseModel(nn.Module):
         
 
     def forward(
-            self,
+        self,
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         use_cache: bool = False,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        hooks: Optional[HookRegistry] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         #this returns a tuple containing :
         #1. logits: (B,T,vocab_size)
@@ -67,11 +69,16 @@ class ARESBaseModel(nn.Module):
             position_ids=position_ids,
             attention_mask=attention_mask,
             use_cache=use_cache,
-            past_key_values=past_key_values
+            past_key_values=past_key_values,
+            hooks=hooks
         )
 
         #project final hidden states to vocab logits
         logits=self.lm_head(hidden_states)
+
+        #dispatch after-logits hook
+        if hooks:
+            hooks.dispatch("after_logits", {"logits": logits})
 
         #compute languafe modelling loss
         loss=None

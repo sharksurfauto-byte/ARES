@@ -5,6 +5,7 @@ from typing import Optional, Tuple, List
 from model.block import TransformerBlock
 from model.layers.embeddings import TokenEmbedding
 from model.layers.positional_embedding import PositionalEmbedding
+from utils.hooks import HookRegistry
 
 class TransformerStack(nn.Module):
     def __init__(self, config: ARESConfig):
@@ -18,7 +19,7 @@ class TransformerStack(nn.Module):
         
         # 2. Decoder Blocks Stack
         self.h = nn.ModuleList([
-            TransformerBlock(config) for _ in range(config.num_hidden_layers)
+            TransformerBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)
         ])
 
         #final layernorm
@@ -30,7 +31,8 @@ class TransformerStack(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        hooks: Optional[HookRegistry] = None
     ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         #returns Tuple of final hidden states and optional updated KV cache list.
         B,T = input_ids.size()
@@ -62,7 +64,8 @@ class TransformerStack(nn.Module):
                 hidden_states,
                 attention_mask=attention_mask,
                 use_cache=use_cache,
-                layer_past=layer_past
+                layer_past=layer_past,
+                hooks=hooks
             )
 
             if use_cache:
@@ -70,4 +73,4 @@ class TransformerStack(nn.Module):
 
         hidden_states=self.ln_f(hidden_states)
 
-        return hidden_states
+        return hidden_states, presents
