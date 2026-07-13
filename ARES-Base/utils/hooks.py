@@ -1,6 +1,4 @@
 #this is a conceptual desgin for ARES Hook system 
-
-# ARES-Base/utils/hooks.py
 from typing import Dict, Any, Callable, List, Optional
 import torch
 

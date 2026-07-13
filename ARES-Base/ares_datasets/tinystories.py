@@ -1,6 +1,6 @@
 from typing import Iterator, Optional
 from tokenizer.tokenizer import BaseTokenizer
-from datasets.base_dataset import BaseTextDataset
+from .base_dataset import BaseTextDataset
 
 class TinyStoriesDataset(BaseTextDataset):
     def __init__(

@@ -1,9 +1,9 @@
 from typing import Optional
 from torch.utils.data import Dataset
 from tokenizer.tokenizer import BaseTokenizer
-from datasets.base_dataset import BaseTextDataset
-from datasets.tinystories import TinyStoriesDataset
-from datasets.openwebtext import OpenWebTextDataset
+from .base_dataset import BaseTextDataset
+from .tinystories import TinyStoriesDataset
+from .openwebtext import OpenWebTextDataset
 
 def get_dataset(
     dataset_name: str,

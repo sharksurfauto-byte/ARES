@@ -1,0 +1,54 @@
+# Python Bytecode and Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+bin/
+lib/
+include/
+
+# IDEs and OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# ARES Data and Cached Datasets
+data/
+ARES-Base/data/
+ARES-Base/data/cache/
+
+# ARES Local Experiments and Logs
+experiments/runs/
+ARES-Base/experiments/runs/
+ARES-Base/experiments/checkpoints/
+
+# Model Weights and Registry JSON (to prevent uploading huge weight checkpoints)
+*.pt
+*.bin
+*.h5
+*.ckpt
+ARES-Base/models/registry.json
+ARES-Base/models/*.pt
+ARES-Base/models/*.json
+
+# Project documentation, research notes, and progress logs
+ARES.md
+Abstract.md
+Next steps
+*progress*
+*Progress*
+*.rar
+*.zip

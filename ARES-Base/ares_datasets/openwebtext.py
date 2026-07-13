@@ -1,7 +1,7 @@
 # ARES-Base/datasets/openwebtext.py
 from typing import Iterator, Optional
 from tokenizer.tokenizer import BaseTokenizer
-from datasets.base_dataset import BaseTextDataset
+from .base_dataset import BaseTextDataset
 
 class OpenWebTextDataset(BaseTextDataset):
     def __init__(
