@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=6e-4, help="Peak learning rate")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers for asynchronous data fetching")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Target execution device")
+    parser.add_argument("--max-examples", type=int, default=None, help="Limit number of dataset blocks to load (default: None for all)")
 
     return parser.parse_args()
 
@@ -104,14 +105,16 @@ def main():
         dataset_name=args.dataset,
         tokenizer=tokenizer,
         max_seq_length=max_seq_len,
-        split="train"
+        split="train",
+        max_examples=args.max_examples
     )
     
     val_dataset = get_dataset(
         dataset_name=args.dataset,
         tokenizer=tokenizer,
         max_seq_length=max_seq_len,
-        split="validation"
+        split="validation",
+        max_examples=args.max_examples // 10 if args.max_examples else None
     )
 
     #enable pinned mem for accelerated CUDA asynchronous DMA transfers

@@ -53,6 +53,8 @@ class BaseTextDataset(Dataset, ABC):
             tokens.append(self.tokenizer.eos_token_id)
             buffer.extend(tokens)
             doc_count+=1
+            if doc_count % 5000 == 0:
+                print(f"[{self.__class__.__name__}] Tokenized {doc_count} documents (Blocks created: {block_count})...")
 
             #while we have enough tokens to form a complete train block
             while len(buffer)>=self.max_seq_length:
