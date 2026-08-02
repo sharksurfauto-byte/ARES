@@ -105,7 +105,7 @@ def main():
 
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
-            inputs_ids=batch.to(args.device)
+            inputs_ids=batch["input_ids"].to(args.device)
             B,T=inputs_ids.shape
 
             #reset temp hook logs
