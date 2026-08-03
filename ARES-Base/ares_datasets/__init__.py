@@ -4,6 +4,7 @@ from tokenizer.tokenizer import BaseTokenizer
 from .base_dataset import BaseTextDataset
 from .tinystories import TinyStoriesDataset
 from .openwebtext import OpenWebTextDataset
+from .wikitext import WikiTextDataset
 
 def get_dataset(
     dataset_name: str,
@@ -36,6 +37,14 @@ def get_dataset(
             max_examples=max_examples,
             **kwargs
         )
-    
+    elif name_clean in ["wikitext", "wiki", "wikitext-103"]:
+        return WikiTextDataset(
+            tokenizer=tokenizer,
+            max_seq_length=max_seq_length,
+            split=split,
+            cache_dir=cache_dir,
+            max_examples=max_examples,
+            **kwargs
+        )
     else:
-        raise ValueError(f"Unsupported dataset name: '{dataset_name}'. Available: 'tinystories', 'openwebtext'")
+        raise ValueError(f"Unsupported dataset name: '{dataset_name}'. Available: 'tinystories', 'openwebtext', 'wikitext'")
