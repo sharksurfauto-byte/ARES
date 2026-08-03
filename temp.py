@@ -17,7 +17,7 @@ weights_path = f"{run_dir}/checkpoints/checkpoint_epoch_1.pt"
 config = ARESConfig.from_yaml(config_path)
 model = ARESBaseModel(config)
 
-# Register it in the registry.json
+# Register it in the fresh registry.json
 registry = ModelRegistry(registry_path="/kaggle/working/ARES/ARES-Base/models/registry.json")
 registry.register_model(
     model_id="ARES-Base-v1.0-tinystories-baseline_run",

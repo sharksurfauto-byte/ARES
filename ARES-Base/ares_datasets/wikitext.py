@@ -1,32 +1,49 @@
-import sys
-from pathlib import Path
-import torch
+# ARES-Base/ares_datasets/wikitext.py
+from typing import Iterator, Optional
+from tokenizer.tokenizer import BaseTokenizer
+from .base_dataset import BaseTextDataset
 
-sys.path.append("/kaggle/working/ARES/ARES-Base")
+class WikiTextDataset(BaseTextDataset):
+    """
+    WikiText-103-v1 streaming dataset wrapper for out-of-distribution transfer probing.
+    """
+    def __init__(
+            self,
+            tokenizer: BaseTokenizer,
+            max_seq_length: int = 1024,
+            split: str = "validation",
+            cache_dir: Optional[str] = "data/cache",
+            max_examples: Optional[int] = None,
+            hf_dataset_name: str = "wikitext"
+    ):
+        self.hf_dataset_name = hf_dataset_name
+        super().__init__(
+            tokenizer=tokenizer,
+            max_seq_length=max_seq_length,
+            split=split,
+            cache_dir=cache_dir,
+            max_examples=max_examples
+        )
 
-from model.config import ARESConfig
-from model.gpt import ARESBaseModel
-from models.registry import ModelRegistry
+    def _get_text_iterator(self) -> Iterator[str]:
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise ImportError("Please install the 'datasets' library: pip install datasets")
+            
+        print(f"[WikiTextDataset] Loading '{self.hf_dataset_name}' (wikitext-103-v1, split {self.split})...")
 
-#paths for restored run
-run_dir = "/kaggle/working/ARES/ARES-Base/experiments/runs/exp_001_baseline_run"
-config_path = f"{run_dir}/configs/model.yaml"
-weights_path = f"{run_dir}/checkpoints/checkpoint_epoch_1.pt"
+        # Load dataset with streaming enabled to prevent massive local downloads
+        dataset = load_dataset(
+            self.hf_dataset_name,
+            "wikitext-103-v1",
+            split=self.split,
+            cache_dir=self.cache_dir,
+            streaming=True
+        )
 
-#init model configs and weights
-config=ARESConfig.from_yaml(config_path)
-model=ARESBaseModel(config)
-
-#register it in registry.json
-registry = ModelRegistry(registry_path="/kaggle/working/ARES/ARES-Base/models/registry.json")
-registry.register_model(
-    model_id="ARES-Base-v1.0-tinystories-baseline_run",
-    architecture="gpt2-decoder-only",
-    model=model,
-    weights_path=weights_path,
-    config_path=config_path,
-    training_dataset="tinystories",
-    total_tokens_trained=125 * 4 * 1024 * 4,
-    val_perplexity=6.88,
-    notes="Restored from Kaggle baseline run"
-)
+        for sample in dataset:
+            text = sample.get("text", "")
+            # Filter out section headers and empty spaces typical in WikiText formatting
+            if text.strip() and not (text.strip().startswith("=") and text.strip().endswith("=")):
+                yield text
