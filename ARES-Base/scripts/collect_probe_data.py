@@ -1,8 +1,10 @@
 # ARES-Base/scripts/collect_probe_data.py
 """
-This script handles the data collection. It runs validation data through the frozen baseline model, 
-intercepts hidden states at specific layer depths using the hook registry, extracts output heuristics, 
-and computes binary token correctness targets.
+ARES Dual-Granularity Activation Collector (GRM + LRM)
+
+Collects two levels of hidden state activations for failure prediction:
+1. GRM (Global Reliability Module): Prompt-level activation (last token of prompt) -> predicts overall sequence success (R_global).
+2. LRM (Local Reliability Module): Autoregressive decoding activations -> predicts next-token correctness (R_local).
 """
 
 import argparse
@@ -22,15 +24,16 @@ from models.registry import ModelRegistry
 from utils.hooks import HookRegistry
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Collect internal activation datasets for ARES Failure Prediction")
+    parser = argparse.ArgumentParser(description="Collect GRM & LRM activation datasets for ARES Failure Prediction")
     parser.add_argument("--model-id", type=str, required=True, help="Model ID registered in ModelRegistry")
     parser.add_argument("--registry-path", type=str, default="models/registry.json", help="Path to registry.json")
     parser.add_argument("--dataset", type=str, default="tinystories", choices=["tinystories", "openwebtext", "wikitext"])
     parser.add_argument("--split", type=str, default="validation", help="Dataset split to collect from")
-    parser.add_argument("--max-examples", type=int, default=1000, help="Maximum number of sequences to process")
-    parser.add_argument("--max-tokens", type=int, default=500000, help="Threshold to stop collecting tokens to prevent OOM")
+    parser.add_argument("--max-examples", type=int, default=150, help="Maximum number of sequences to process")
+    parser.add_argument("--max-tokens", type=int, default=150000, help="Threshold to stop collecting tokens")
+    parser.add_argument("--prompt-length", type=int, default=256, help="Token length designated as prompt context")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for forward pass")
-    parser.add_argument("--layers", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11", help="Comma-separated layer indices to extract activations from")
+    parser.add_argument("--layers", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11", help="Layer indices to extract activations from")
     parser.add_argument("--output-dir", type=str, default="data/probe_data", help="Directory to save collected tensors")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Target device")
     parser.add_argument("--untrained", action="store_true", help="If set, initializes model weights randomly (Control Task)")
@@ -39,12 +42,13 @@ def parse_args():
 def main():
     args = parse_args()
     target_layers = [int(x.strip()) for x in args.layers.split(",")]
+    P = args.prompt_length
 
-    print("="*70)
-    print(f" ARES Activation Collector | Target Layers: {target_layers} | Device: {args.device.upper()}")
+    print("="*75)
+    print(f" ARES Dual Collector (GRM + LRM) | Layers: {target_layers} | Device: {args.device.upper()}")
     if args.untrained:
         print(" [CONTROL EXPERIMENT] Running with untrained (randomly initialized) weights!")
-    print("="*70)
+    print("="*75)
 
     # 1. Load model from registry or initialize randomly for control
     registry = ModelRegistry(registry_path=args.registry_path)
@@ -52,7 +56,7 @@ def main():
         print(f"\n[1/3] Initializing model '{args.model_id}' with random (untrained) weights...")
         meta = registry.registry.get(args.model_id)
         if not meta:
-            raise ValueError(f"Model ID '{args.model_id}' not found in registry. We need its config path.")
+            raise ValueError(f"Model ID '{args.model_id}' not found in registry.")
         
         from model.config import ARESConfig
         from model.gpt import ARESBaseModel
@@ -85,61 +89,58 @@ def main():
 
     # 3. Setup hooks to intercept layer outputs
     hooks = HookRegistry()
-
-    # Store activations: layer idx -> list of tensors
     captured_activations: Dict[int, List[torch.Tensor]] = {layer: [] for layer in target_layers}
 
     def save_activation_callback(payload):
         l_idx = payload.get("layer_idx")
         if l_idx in target_layers:
-            # Capture block output and detach from computation graph to save memory
             captured_activations[l_idx].append(payload["block_output"].detach().cpu())
 
     hooks.register("after_block", save_activation_callback)
 
-    # Data collection accumulators
-    layer_tensors: Dict[int, List[torch.Tensor]] = {layer: [] for layer in target_layers}
+    # Accumulators
+    lrm_layer_tensors: Dict[int, List[torch.Tensor]] = {layer: [] for layer in target_layers}
+    grm_layer_tensors: Dict[int, List[torch.Tensor]] = {layer: [] for layer in target_layers}
+    
+    collected_lrm_labels = []
+    collected_grm_labels = []
+    collected_token_ids = []
     collected_heuristics = {
         "max_prob": [],
         "entropy": [],
         "margin": [],
-        "token_nll": [],
-        "position": []
+        "token_nll": []
     }
-    collected_labels = []
-    collected_token_ids = []
 
     total_tokens_collected = 0
     cross_entropy_fn = torch.nn.CrossEntropyLoss(reduction="none")
 
-    print(f"\n[2/3] Processing sequences and capturing activations...")
+    print(f"\n[2/3] Processing sequences & extracting GRM + LRM activations...")
 
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
             inputs_ids = batch["input_ids"].to(args.device)
             B, T = inputs_ids.shape
+            
+            if T <= P:
+                continue
 
-            # Reset temp hook logs
             for layer in target_layers:
                 captured_activations[layer].clear()
 
-            # Forward pass (triggers block hooks)
+            # Forward pass
             logits, _, _ = model(inputs_ids, hooks=hooks)
 
-            # Check if all target layers are captured
             missing_layers = [l for l in target_layers if not captured_activations[l]]
             if missing_layers:
-                print(f"[Warning] Step {step}: Missing activations for layers {missing_layers}. Skipping batch.")
                 continue
 
-            # Targets are shift-right next tokens
             shift_targets = inputs_ids[:, 1:].cpu()
             shift_logits = logits[:, :-1, :].cpu()
 
             probs = torch.softmax(shift_logits, dim=-1)
             max_prob, preds = torch.max(probs, dim=-1)
             entropy = -torch.sum(probs * torch.log(probs + 1e-12), dim=-1)
-            
             top2_probs, _ = torch.topk(probs, k=2, dim=-1)
             margin = top2_probs[:, :, 0] - top2_probs[:, :, 1]
             
@@ -148,40 +149,49 @@ def main():
                 shift_targets.reshape(-1)
             ).reshape(B, T - 1)
 
-            positions = torch.arange(1, T, dtype=torch.float32).unsqueeze(0).expand(B, -1)
-
-            # Binary Correctness: 1 if model predicted target token, else 0
+            # Per-token correctness: 1 if correct token, 0 if failure
             correctness = (preds == shift_targets).long()
+            
+            # --- LRM (Local Decoding Step Activations) ---
+            # Decoding steps: P-1 to T-2 (aligns with target tokens P to T-1)
+            lrm_targets = correctness[:, P-1:]
+            collected_lrm_labels.append(lrm_targets.reshape(-1))
+            collected_token_ids.append(shift_targets[:, P-1:].reshape(-1))
+            
+            collected_heuristics["max_prob"].append(max_prob[:, P-1:].reshape(-1))
+            collected_heuristics["entropy"].append(entropy[:, P-1:].reshape(-1))
+            collected_heuristics["margin"].append(margin[:, P-1:].reshape(-1))
+            collected_heuristics["token_nll"].append(token_nll[:, P-1:].reshape(-1))
 
-            # Accumulate data
-            collected_labels.append(correctness.reshape(-1))
-            collected_token_ids.append(shift_targets.reshape(-1))
-            collected_heuristics["max_prob"].append(max_prob.reshape(-1))
-            collected_heuristics["entropy"].append(entropy.reshape(-1))
-            collected_heuristics["margin"].append(margin.reshape(-1))
-            collected_heuristics["token_nll"].append(token_nll.reshape(-1))
-            collected_heuristics["position"].append(positions.reshape(-1))
+            # --- GRM (Global Prompt-Level Activations) ---
+            # Sequence success label: 1 if >70% tokens generated correctly in generation block, else 0
+            gen_accuracy = correctness[:, P-1:].float().mean(dim=-1)
+            grm_labels = (gen_accuracy >= 0.70).long()
+            collected_grm_labels.append(grm_labels)
 
-            # Store hidden states
+            # Extract layer hidden states
             for layer in target_layers:
-                # Hook shape: (B, T, H)
-                block_out = captured_activations[layer][0]
-                shift_block_out = block_out[:, :-1, :]  # align with targets
-                layer_tensors[layer].append(shift_block_out.reshape(-1, model.config.hidden_size))
+                block_out = captured_activations[layer][0] # Shape: (B, T, H)
+                
+                # GRM: Hidden state at last prompt token (index P-1)
+                grm_act = block_out[:, P-1, :] # Shape: (B, H)
+                grm_layer_tensors[layer].append(grm_act)
+                
+                # LRM: Hidden states during generation (indices P-1 to T-2)
+                lrm_act = block_out[:, P-1:-1, :] # Shape: (B, T-P, H)
+                lrm_layer_tensors[layer].append(lrm_act.reshape(-1, model.config.hidden_size))
 
-            total_tokens_collected += correctness.numel()
+            total_tokens_collected += lrm_targets.numel()
 
             if (step + 1) % 20 == 0 or (step + 1) == len(dataloader):
-                print(f"  Processed {step + 1}/{len(dataloader)} batches ({total_tokens_collected:,} tokens)...")
+                print(f"  Processed {step + 1}/{len(dataloader)} batches ({total_tokens_collected:,} LRM tokens)...")
 
             if total_tokens_collected >= args.max_tokens:
                 print(f"--> Reached max token threshold ({args.max_tokens:,}). Stopping collection.")
                 break
 
     # 4. Save collected data to disk
-    print(f"\n[3/3] Saving collected dataset tensors to disk...")
-    
-    # We append a specific suffix to directories for control groups
+    print(f"\n[3/3] Saving GRM + LRM dataset tensors to disk...")
     folder_name = args.dataset
     if args.untrained:
         folder_name += "_untrained"
@@ -189,9 +199,15 @@ def main():
     out_path = Path(args.output_dir) / folder_name
     out_path.mkdir(parents=True, exist_ok=True)
 
-    Y = torch.cat(collected_labels, dim=0)
-    torch.save(Y, out_path / "labels.pt")
+    # Save Labels
+    Y_lrm = torch.cat(collected_lrm_labels, dim=0)
+    Y_grm = torch.cat(collected_grm_labels, dim=0)
+    torch.save(Y_lrm, out_path / "labels_lrm.pt")
+    torch.save(Y_grm, out_path / "labels_grm.pt")
     
+    # Legacy fallback alias for existing scripts
+    torch.save(Y_lrm, out_path / "labels.pt")
+
     token_ids_tensor = torch.cat(collected_token_ids, dim=0)
     torch.save(token_ids_tensor, out_path / "token_ids.pt")
 
@@ -200,20 +216,23 @@ def main():
     }
     torch.save(heuristics_dict, out_path / "heuristics.pt")
 
+    # Save layer tensors
     for layer in target_layers:
-        X_layer = torch.cat(layer_tensors[layer], dim=0)
-        x_file = out_path / f"X_layer_{layer}.pt"
-        torch.save(X_layer, x_file)
-        print(f"  - Saved Layer {layer:02d} activations: {x_file} ({X_layer.shape})")
+        # Save LRM (Local)
+        X_lrm = torch.cat(lrm_layer_tensors[layer], dim=0)
+        torch.save(X_lrm, out_path / f"X_lrm_layer_{layer}.pt")
+        torch.save(X_lrm, out_path / f"X_layer_{layer}.pt") # fallback alias
+        
+        # Save GRM (Global)
+        X_grm = torch.cat(grm_layer_tensors[layer], dim=0)
+        torch.save(X_grm, out_path / f"X_grm_layer_{layer}.pt")
+        
+        print(f"  - Saved Layer {layer:02d}: GRM {X_grm.shape} | LRM {X_lrm.shape}")
 
-    # Logging summary statistics
-    correct_count = (Y == 1).sum().item()
-    incorrect_count = (Y == 0).sum().item()
-    accuracy = (correct_count / Y.numel()) * 100 if Y.numel() > 0 else 0
-    print(f"\n[SUCCESS] Final Dataset Generated:")
-    print(f"  - Output Folder: {out_path}")
-    print(f"  - Total Tokens: {Y.numel():,}")
-    print(f"  - Model Accuracy: {accuracy:.2f}% (Correct: {correct_count:,} | Failures: {incorrect_count:,})")
+    print(f"\n[SUCCESS] Final Dataset Generated at '{out_path}':")
+    print(f"  - Total Sequences (GRM): {Y_grm.numel():,} | Total Tokens (LRM): {Y_lrm.numel():,}")
+    print(f"  - GRM Prompt Success Rate: {(Y_grm == 1).float().mean() * 100:.2f}%")
+    print(f"  - LRM Token Accuracy: {(Y_lrm == 1).float().mean() * 100:.2f}%")
 
 if __name__ == "__main__":
     main()

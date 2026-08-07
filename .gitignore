@@ -48,11 +48,11 @@ ARES-Base/models/*.json
 ARES.md
 Abstract.md
 Next steps
-next_steps.md
-ARES_Novelty_Report.md
-ares-base-phase2-results
-*progress*
-*Progress*
+# next_steps.md
+# ARES_Novelty_Report.md
+# ares-base-phase2-results
+# *progress*
+# *Progress*
 *.rar
 *.zip
 input.txt

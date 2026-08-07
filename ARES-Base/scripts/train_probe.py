@@ -1,4 +1,15 @@
 # ARES-Base/scripts/train_probe.py
+"""
+ARES Probing Suite (GRM + LRM)
+
+Trains and evaluates both:
+1. GRM (Global Reliability Module): Prompt-level failure probes (R_global)
+2. LRM (Local Reliability Module): Token-level failure probes (R_local)
+
+Evaluates zero-shot OOD transfer (WikiText, OpenWebText), Hewitt-Liang Selectivity, 
+and reports mean ± std across replication seeds.
+"""
+
 import argparse
 import os
 import sys
@@ -56,23 +67,6 @@ def compute_ece(y_true: np.ndarray, y_pred_prob: np.ndarray, n_bins: int = 10) -
             ece += prop_in_bin * abs(accuracy_in_bin - avg_confidence_in_bin)
     return ece
 
-# --- Selective Prediction Curve Evaluator ---
-def compute_selective_accuracy(y_base_correct: np.ndarray, y_pred_failure_prob: np.ndarray, coverages: list) -> Dict[float, float]:
-    sorted_indices = np.argsort(y_pred_failure_prob)
-    total_tokens = len(y_base_correct)
-    
-    results = {}
-    for coverage in coverages:
-        n_retain = int(total_tokens * coverage)
-        if n_retain == 0:
-            results[coverage] = 1.0
-            continue
-            
-        retained_indices = sorted_indices[:n_retain]
-        retained_correctness = y_base_correct[retained_indices]
-        results[coverage] = np.mean(retained_correctness)
-    return results
-
 def evaluate_metrics(y_true: np.ndarray, y_pred_prob: np.ndarray) -> Dict[str, float]:
     if len(np.unique(y_true)) < 2:
         auroc, auprc = 0.5, 0.5
@@ -129,32 +123,21 @@ def evaluate_probe_model(model: nn.Module, X: torch.Tensor, device: str) -> np.n
 
 # --- Hewitt-Liang Control Task Mapping ---
 def construct_control_labels(token_ids: np.ndarray, y_real: np.ndarray, seed: int) -> np.ndarray:
-    """
-    Constructs a control task by mapping each token ID (vocabulary word) 
-    to a random binary label, preserving the overall label distribution.
-    """
     np.random.seed(seed)
     unique_tokens = np.unique(token_ids)
-    
-    # Probability of label 1 in the true task
     p_one = np.mean(y_real)
-    
-    # Assign a fixed random label to each unique token
     token_to_label = {
         token: np.random.choice([0, 1], p=[1 - p_one, p_one]) for token in unique_tokens
     }
-    
-    # Construct the control label array
-    y_control = np.array([token_to_label[token] for token in token_ids])
-    return y_control
+    return np.array([token_to_label[token] for token in token_ids])
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate uncertainty heuristics and train reliability probes")
+    parser = argparse.ArgumentParser(description="Evaluate GRM and LRM probes on ID and OOD splits")
     parser.add_argument("--data-dir", type=str, default="data/probe_data", help="Directory where collected data is saved")
     parser.add_argument("--output-dir", type=str, default="experiments/probe_results", help="Directory to save outputs")
     parser.add_argument("--id-dataset", type=str, default="tinystories", help="In-distribution dataset folder name")
-    parser.add_argument("--ood-datasets", type=str, default="wikitext,openwebtext", help="Comma-separated OOD dataset folder names")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs for neural probes")
+    parser.add_argument("--ood-datasets", type=str, default="wikitext,openwebtext", help="Comma-separated OOD dataset names")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size for training")
     parser.add_argument("--layers", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11", help="Layers to train probes on")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Target device")
@@ -167,191 +150,203 @@ def main():
     out_path = Path(args.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     
-    # 1. Load ID Dataset (e.g. TinyStories)
     id_dir = data_path / args.id_dataset
     if not id_dir.exists():
-        raise FileNotFoundError(f"In-distribution data directory '{id_dir}' does not exist. Run collection script first.")
+        raise FileNotFoundError(f"In-distribution data directory '{id_dir}' does not exist.")
         
-    print(f"[1/5] Loading in-distribution '{args.id_dataset}'...")
-    Y_id_correct = torch.load(id_dir / "labels.pt").numpy()
+    print(f"[1/4] Loading in-distribution '{args.id_dataset}' (GRM + LRM)...")
+    
+    # Load LRM (Token-Level)
+    Y_lrm_correct = torch.load(id_dir / "labels_lrm.pt" if (id_dir / "labels_lrm.pt").exists() else id_dir / "labels.pt").numpy()
     token_ids_id = torch.load(id_dir / "token_ids.pt").numpy()
     heuristics_id = torch.load(id_dir / "heuristics.pt")
-    
-    # Failure label is 1, success is 0
-    Y_id_failure = 1 - Y_id_correct
-    
-    # Prepare OOD Datasets (if they exist)
+    Y_lrm_failure = 1 - Y_lrm_correct
+
+    # Load GRM (Prompt-Level) if present
+    has_grm = (id_dir / "labels_grm.pt").exists()
+    if has_grm:
+        Y_grm_correct = torch.load(id_dir / "labels_grm.pt").numpy()
+        Y_grm_failure = 1 - Y_grm_correct
+
+    # Load OOD Datasets
     ood_names = [x.strip() for x in args.ood_datasets.split(",")]
     ood_data = {}
     for name in ood_names:
         ood_dir = data_path / name
         if ood_dir.exists():
             print(f" Found OOD dataset directory '{name}'. Preparing zero-shot evaluation.")
-            Y_ood_correct = torch.load(ood_dir / "labels.pt").numpy()
-            heuristics_ood = torch.load(ood_dir / "heuristics.pt")
+            Y_lrm_ood_correct = torch.load(ood_dir / "labels_lrm.pt" if (ood_dir / "labels_lrm.pt").exists() else ood_dir / "labels.pt").numpy()
+            has_grm_ood = (ood_dir / "labels_grm.pt").exists()
+            Y_grm_ood_correct = torch.load(ood_dir / "labels_grm.pt").numpy() if has_grm_ood else None
+            
             ood_data[name] = {
-                "Y_correct": Y_ood_correct,
-                "Y_failure": 1 - Y_ood_correct,
-                "heuristics": heuristics_ood,
+                "Y_lrm_failure": 1 - Y_lrm_ood_correct,
+                "Y_grm_failure": (1 - Y_grm_ood_correct) if has_grm_ood else None,
                 "dir": ood_dir
             }
 
-    # 2. Evaluate Conventional Heuristics on ID Split
-    print("\n[2/5] Evaluating Conventional Heuristics (In-Distribution Validation)...")
-    indices = np.arange(len(Y_id_failure))
-    _, val_idx = train_test_split(indices, test_size=0.2, random_state=42) # fixed eval split for heuristics
+    # Evaluate Heuristics on LRM
+    indices_lrm = np.arange(len(Y_lrm_failure))
+    _, val_idx = train_test_split(indices_lrm, test_size=0.2, random_state=42)
+    y_val_fail = Y_lrm_failure[val_idx]
     
-    y_val_failure = Y_id_failure[val_idx]
     max_prob_val = heuristics_id["max_prob"].numpy()[val_idx]
     entropy_val = heuristics_id["entropy"].numpy()[val_idx]
-    margin_val = heuristics_id["margin"].numpy()[val_idx]
     
     heuristics_results = {
-        "Max Probability": evaluate_metrics(y_val_failure, 1.0 - max_prob_val),
-        "Predictive Entropy": evaluate_metrics(y_val_failure, entropy_val / max(1.0, entropy_val.max())),
-        "Prob Margin": evaluate_metrics(y_val_failure, 1.0 - margin_val)
+        "Max Probability (LRM)": evaluate_metrics(y_val_fail, 1.0 - max_prob_val),
+        "Predictive Entropy (LRM)": evaluate_metrics(y_val_fail, entropy_val / max(1.0, entropy_val.max()))
     }
 
-    # 3. Layer Probing Sweep with Replication Seeds
-    print(f"\n[3/5] Starting Layer Probing Sweep ({args.num_seeds} replication seeds)...")
+    print(f"\n[2/4] Layer Probing Sweep ({args.num_seeds} seeds)...")
     layers = [int(x.strip()) for x in args.layers.split(",")]
     seeds = [42 + i for i in range(args.num_seeds)]
-    
-    # Dictionary to store accumulated scores for stats reporting
-    # Structure: layer_name -> metric -> list of values
     performance_records = {}
 
     for layer in layers:
-        x_file = id_dir / f"X_layer_{layer}.pt"
-        if not x_file.exists():
-            print(f" [Warning] Layer {layer} activation file {x_file} not found. Skipping.")
+        # Check files
+        lrm_file = id_dir / f"X_lrm_layer_{layer}.pt" if (id_dir / f"X_lrm_layer_{layer}.pt").exists() else id_dir / f"X_layer_{layer}.pt"
+        if not lrm_file.exists():
             continue
             
         print(f" Processing Layer {layer:02d}...")
-        X = torch.load(x_file)
-        
-        # Load OOD Layer activations (if available)
-        ood_layer_X = {}
-        for name, data in ood_data.items():
-            ood_file = data["dir"] / f"X_layer_{layer}.pt"
-            if ood_file.exists():
-                ood_layer_X[name] = torch.load(ood_file)
-        
-        # Loop over replication seeds
-        for seed in seeds:
-            # ID Split (80/20)
-            train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=seed)
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train_fail, y_val_fail = Y_id_failure[train_idx], Y_id_failure[val_idx]
-            
-            # Hewitt-Liang Control Labels
-            y_train_control = construct_control_labels(token_ids_id[train_idx], y_train_fail, seed=seed)
-            y_val_control = construct_control_labels(token_ids_id[val_idx], y_val_fail, seed=seed)
-            
-            # Setup architectures
-            models = {
-                "Linear": LinearProbe(input_dim=X.shape[1]),
-                "MLP": MLPProbe(input_dim=X.shape[1])
-            }
-            
-            for m_name, probe in models.items():
-                # A. Train Probe on Real Task
-                train_probe_model(probe, X_train, torch.tensor(y_train_fail), args.device, epochs=args.epochs, batch_size=args.batch_size)
-                
-                # Evaluate ID Validation
-                preds_val = evaluate_probe_model(probe, X_val, args.device)
-                metrics_id = evaluate_metrics(y_val_fail, preds_val)
-                
-                # B. Zero-Shot OOD Generalization
-                ood_metrics_eval = {}
-                for ood_name, ood_dict in ood_data.items():
-                    if ood_name in ood_layer_X:
-                        # No retraining of the probe! Evaluating frozen on OOD features
-                        preds_ood = evaluate_probe_model(probe, ood_layer_X[ood_name], args.device)
-                        metrics_ood = evaluate_metrics(ood_dict["Y_failure"], preds_ood)
-                        ood_metrics_eval[ood_name] = metrics_ood
-                
-                # C. Hewitt-Liang Control Task
-                control_probe = LinearProbe(input_dim=X.shape[1]) if m_name == "Linear" else MLPProbe(input_dim=X.shape[1])
-                train_probe_model(control_probe, X_train, torch.tensor(y_train_control), args.device, epochs=args.epochs, batch_size=args.batch_size)
-                preds_control = evaluate_probe_model(control_probe, X_val, args.device)
-                metrics_control = evaluate_metrics(y_val_control, preds_control)
-                
-                # Calculate Selectivity
-                selectivity = metrics_id["accuracy"] - metrics_control["accuracy"]
-                
-                # Record metrics
-                rec_keys = [("ID", metrics_id)]
-                for ood_name, m_dict in ood_metrics_eval.items():
-                    rec_keys.append((f"OOD_{ood_name}", m_dict))
-                rec_keys.append(("Control", metrics_control))
-                
-                for key_prefix, metrics_dict in rec_keys:
-                    rec_name = f"Layer_{layer:02d}_{m_name}_{key_prefix}"
-                    if rec_name not in performance_records:
-                        performance_records[rec_name] = {m: [] for m in ["auroc", "auprc", "ece", "accuracy", "brier"]}
-                        performance_records[rec_name]["selectivity"] = []
-                    
-                    for m in ["auroc", "auprc", "ece", "accuracy", "brier"]:
-                        performance_records[rec_name][m].append(metrics_dict[m])
-                    performance_records[rec_name]["selectivity"].append(selectivity)
+        X_lrm = torch.load(lrm_file)
+        X_grm = torch.load(id_dir / f"X_grm_layer_{layer}.pt") if has_grm and (id_dir / f"X_grm_layer_{layer}.pt").exists() else None
 
-    # 4. Display Stats-Backed Metric Summaries
-    print("\n" + "=" * 110)
-    print(f" {'Method/Layer':<30} | {'AUROC':<15} | {'AUPRC':<15} | {'ECE':<15} | {'Brier':<15} | {'Selectivity':<12}")
-    print("=" * 110)
+        # OOD Activations
+        ood_lrm_X = {}
+        ood_grm_X = {}
+        for o_name, o_dict in ood_data.items():
+            f_lrm = o_dict["dir"] / f"X_lrm_layer_{layer}.pt" if (o_dict["dir"] / f"X_lrm_layer_{layer}.pt").exists() else o_dict["dir"] / f"X_layer_{layer}.pt"
+            if f_lrm.exists():
+                ood_lrm_X[o_name] = torch.load(f_lrm)
+            f_grm = o_dict["dir"] / f"X_grm_layer_{layer}.pt"
+            if f_grm.exists():
+                ood_grm_X[o_name] = torch.load(f_grm)
+
+        for seed in seeds:
+            # --- LRM (Token-Level Probing) ---
+            tr_idx, val_idx = train_test_split(indices_lrm, test_size=0.2, random_state=seed)
+            X_tr, X_va = X_lrm[tr_idx], X_lrm[val_idx]
+            y_tr_fail, y_va_fail = Y_lrm_failure[tr_idx], Y_lrm_failure[val_idx]
+            y_tr_ctrl = construct_control_labels(token_ids_id[tr_idx], y_tr_fail, seed=seed)
+            y_va_ctrl = construct_control_labels(token_ids_id[val_idx], y_va_fail, seed=seed)
+
+            for m_name in ["Linear", "MLP"]:
+                probe = LinearProbe(X_lrm.shape[1]) if m_name == "Linear" else MLPProbe(X_lrm.shape[1])
+                train_probe_model(probe, X_tr, torch.tensor(y_tr_fail), args.device, epochs=args.epochs, batch_size=args.batch_size)
+                
+                p_val = evaluate_probe_model(probe, X_va, args.device)
+                m_id = evaluate_metrics(y_va_fail, p_val)
+
+                # Control Probe
+                ctrl_probe = LinearProbe(X_lrm.shape[1]) if m_name == "Linear" else MLPProbe(X_lrm.shape[1])
+                train_probe_model(ctrl_probe, X_tr, torch.tensor(y_tr_ctrl), args.device, epochs=args.epochs, batch_size=args.batch_size)
+                p_ctrl = evaluate_probe_model(ctrl_probe, X_va, args.device)
+                m_ctrl = evaluate_metrics(y_va_ctrl, p_ctrl)
+                selectivity = m_id["accuracy"] - m_ctrl["accuracy"]
+
+                rec_key = f"L{layer:02d}_{m_name}_LRM_ID"
+                if rec_key not in performance_records:
+                    performance_records[rec_key] = {met: [] for met in ["auroc", "auprc", "ece", "brier"]}
+                    performance_records[rec_key]["selectivity"] = []
+                for met in ["auroc", "auprc", "ece", "brier"]:
+                    performance_records[rec_key][met].append(m_id[met])
+                performance_records[rec_key]["selectivity"].append(selectivity)
+
+                # OOD LRM Eval
+                for o_name in ood_lrm_X:
+                    p_ood = evaluate_probe_model(probe, ood_lrm_X[o_name], args.device)
+                    m_ood = evaluate_metrics(ood_data[o_name]["Y_lrm_failure"], p_ood)
+                    o_key = f"L{layer:02d}_{m_name}_LRM_OOD_{o_name}"
+                    if o_key not in performance_records:
+                        performance_records[o_key] = {met: [] for met in ["auroc", "auprc", "ece", "brier"]}
+                    for met in ["auroc", "auprc", "ece", "brier"]:
+                        performance_records[o_key][met].append(m_ood[met])
+
+            # --- GRM (Prompt-Level Probing) ---
+            if X_grm is not None:
+                indices_grm = np.arange(len(Y_grm_failure))
+                tr_g_idx, va_g_idx = train_test_split(indices_grm, test_size=0.2, random_state=seed)
+                X_tr_g, X_va_g = X_grm[tr_g_idx], X_grm[va_g_idx]
+                y_tr_g_fail, y_va_g_fail = Y_grm_failure[tr_g_idx], Y_grm_failure[va_g_idx]
+
+                for m_name in ["Linear", "MLP"]:
+                    g_probe = LinearProbe(X_grm.shape[1]) if m_name == "Linear" else MLPProbe(X_grm.shape[1])
+                    train_probe_model(g_probe, X_tr_g, torch.tensor(y_tr_g_fail), args.device, epochs=args.epochs, batch_size=args.batch_size)
+                    
+                    p_va_g = evaluate_probe_model(g_probe, X_va_g, args.device)
+                    m_g_id = evaluate_metrics(y_va_g_fail, p_va_g)
+                    
+                    rec_key = f"L{layer:02d}_{m_name}_GRM_ID"
+                    if rec_key not in performance_records:
+                        performance_records[rec_key] = {met: [] for met in ["auroc", "auprc", "ece", "brier"]}
+                    for met in ["auroc", "auprc", "ece", "brier"]:
+                        performance_records[rec_key][met].append(m_g_id[met])
+
+                    # OOD GRM Eval
+                    for o_name in ood_grm_X:
+                        if ood_data[o_name]["Y_grm_failure"] is not None:
+                            p_g_ood = evaluate_probe_model(g_probe, ood_grm_X[o_name], args.device)
+                            m_g_ood = evaluate_metrics(ood_data[o_name]["Y_grm_failure"], p_g_ood)
+                            og_key = f"L{layer:02d}_{m_name}_GRM_OOD_{o_name}"
+                            if og_key not in performance_records:
+                                performance_records[og_key] = {met: [] for met in ["auroc", "auprc", "ece", "brier"]}
+                            for met in ["auroc", "auprc", "ece", "brier"]:
+                                performance_records[og_key][met].append(m_g_ood[met])
+
+    # Display Metrics Table
+    print("\n" + "=" * 115)
+    print(f" {'Method / Granularity':<32} | {'AUROC':<15} | {'AUPRC':<15} | {'ECE':<15} | {'Brier':<15} | {'Selectivity':<10}")
+    print("=" * 115)
     
-    # Print heuristics
     for name, r in heuristics_results.items():
-        print(f" {name:<30} | {r['auroc']:.4f}        | {r['auprc']:.4f}        | {r['ece']:.4f}        | {r['brier']:.4f}        | N/A")
-    print("-" * 110)
-    
-    # Print Probes with mean ± std
-    summary_data = {}
+        print(f" {name:<32} | {r['auroc']:.4f}        | {r['auprc']:.4f}        | {r['ece']:.4f}        | {r['brier']:.4f}        | N/A")
+    print("-" * 115)
+
     for layer in layers:
         for m_name in ["Linear", "MLP"]:
-            # Print ID validation
-            id_key = f"Layer_{layer:02d}_{m_name}_ID"
-            if id_key in performance_records:
-                r_id = performance_records[id_key]
-                print(f" L{layer:02d} {m_name:<25} | "
-                      f"{np.mean(r_id['auroc']):.4f}±{np.std(r_id['auroc']):.3f} | "
-                      f"{np.mean(r_id['auprc']):.4f}±{np.std(r_id['auprc']):.3f} | "
-                      f"{np.mean(r_id['ece']):.4f}±{np.std(r_id['ece']):.3f} | "
-                      f"{np.mean(r_id['brier']):.4f}±{np.std(r_id['brier']):.3f} | "
-                      f"{np.mean(r_id['selectivity'])*100:.1f}%")
+            # LRM
+            k_lrm = f"L{layer:02d}_{m_name}_LRM_ID"
+            if k_lrm in performance_records:
+                r = performance_records[k_lrm]
+                sel_str = f"{np.mean(r['selectivity'])*100:.1f}%" if "selectivity" in r else "N/A"
+                print(f" L{layer:02d} {m_name} LRM (Token ID)          | "
+                      f"{np.mean(r['auroc']):.4f}±{np.std(r['auroc']):.3f} | "
+                      f"{np.mean(r['auprc']):.4f}±{np.std(r['auprc']):.3f} | "
+                      f"{np.mean(r['ece']):.4f}±{np.std(r['ece']):.3f} | "
+                      f"{np.mean(r['brier']):.4f}±{np.std(r['brier']):.3f} | "
+                      f"{sel_str}")
                 
-                # Print OOD validation zero-shot scores
-                for ood_name in ood_data:
-                    ood_key = f"Layer_{layer:02d}_{m_name}_OOD_{ood_name}"
-                    if ood_key in performance_records:
-                        r_ood = performance_records[ood_key]
-                        print(f"   -> OOD [{ood_name:<16}] | "
-                              f"{np.mean(r_ood['auroc']):.4f}±{np.std(r_ood['auroc']):.3f} | "
-                              f"{np.mean(r_ood['auprc']):.4f}±{np.std(r_ood['auprc']):.3f} | "
-                              f"{np.mean(r_ood['ece']):.4f}±{np.std(r_ood['ece']):.3f} | "
-                              f"{np.mean(r_ood['brier']):.4f}±{np.std(r_ood['brier']):.3f} | "
+                # OOD LRM
+                for o_name in ood_names:
+                    k_ood = f"L{layer:02d}_{m_name}_LRM_OOD_{o_name}"
+                    if k_ood in performance_records:
+                        ro = performance_records[k_ood]
+                        print(f"   -> LRM OOD [{o_name:<15}] | "
+                              f"{np.mean(ro['auroc']):.4f}±{np.std(ro['auroc']):.3f} | "
+                              f"{np.mean(ro['auprc']):.4f}±{np.std(ro['auprc']):.3f} | "
+                              f"{np.mean(ro['ece']):.4f}±{np.std(ro['ece']):.3f} | "
+                              f"{np.mean(ro['brier']):.4f}±{np.std(ro['brier']):.3f} | "
                               f"N/A")
-                
-                # Print Control Gating (Selectivity Check)
-                control_key = f"Layer_{layer:02d}_{m_name}_Control"
-                if control_key in performance_records:
-                    r_ctrl = performance_records[control_key]
-                    print(f"   -> Control [Hewitt-Liang]   | "
-                          f"{np.mean(r_ctrl['auroc']):.4f}±{np.std(r_ctrl['auroc']):.3f} | "
-                          f"{np.mean(r_ctrl['auprc']):.4f}±{np.std(r_ctrl['auprc']):.3f} | "
-                          f"{np.mean(r_ctrl['ece']):.4f}±{np.std(r_ctrl['ece']):.3f} | "
-                          f"{np.mean(r_ctrl['brier']):.4f}±{np.std(r_ctrl['brier']):.3f} | "
-                          f"N/A")
-                print("-" * 110)
 
-    # 5. Export results to JSON
+            # GRM
+            k_grm = f"L{layer:02d}_{m_name}_GRM_ID"
+            if k_grm in performance_records:
+                rg = performance_records[k_grm]
+                print(f" L{layer:02d} {m_name} GRM (Prompt ID)         | "
+                      f"{np.mean(rg['auroc']):.4f}±{np.std(rg['auroc']):.3f} | "
+                      f"{np.mean(rg['auprc']):.4f}±{np.std(rg['auprc']):.3f} | "
+                      f"{np.mean(rg['ece']):.4f}±{np.std(rg['ece']):.3f} | "
+                      f"{np.mean(rg['brier']):.4f}±{np.std(rg['brier']):.3f} | "
+                      f"N/A")
+            print("-" * 115)
+
+    # Save to JSON
     export_dict = {}
     for k, v in performance_records.items():
         export_dict[k] = {m: [float(val) for val in v[m]] for m in v}
-    
-    # Save results file
-    res_file = out_path / "phase_2_5_metrics.json"
+    res_file = out_path / "phase_2_5_grm_lrm_metrics.json"
     with open(res_file, "w") as f:
         json.dump(export_dict, f, indent=4)
     print(f"\n[SUCCESS] Phase 2.5 Metrics exported to: {res_file}")
