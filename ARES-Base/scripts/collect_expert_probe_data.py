@@ -129,9 +129,9 @@ def main():
                 continue
             shift_targets_gpu = input_ids[:, 1:] # Target tokens (B, T-1) on GPU
 
-            # Clear previous batch activations & run model forward pass with hooks
+            # Clear previous batch activations & run DataParallel model forward pass across Dual T4 GPUs
             captured_activations.clear()
-            logits, _, _ = raw_model(input_ids, hooks=hooks)
+            logits, _, _ = model(input_ids, hooks=hooks)
 
             for layer_idx in moe_layers:
                 if layer_idx not in captured_activations:

@@ -221,9 +221,9 @@ def main():
 
                     shift_targets = input_ids[:, 1:].to(device)
 
-                    # Base model forward pass with hooks
+                    # Base model DataParallel forward pass across Dual T4 GPUs
                     captured_activations.clear()
-                    logits, _, _ = raw_model(input_ids, hooks=hooks)
+                    logits, _, _ = model(input_ids, hooks=hooks)
 
                     if moe_layers[0] not in captured_activations:
                         continue
