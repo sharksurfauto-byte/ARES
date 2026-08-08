@@ -116,15 +116,24 @@ class ModelRegistry:
         Reads registry metadata, instantiates the model cleanly from its snapshotted config,
         and loads the checkpoint weights into memory.
         """
-        meta = self.get_metadata(model_id)
-        
+        try:
+            meta = self.get_metadata(model_id)
+        except KeyError:
+            auto_entry = self._auto_discover_model(model_id)
+            if not auto_entry:
+                raise
+            meta = auto_entry
+
         config_path = meta["config_path"]
         weights_path = meta["weights_path"]
 
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Registered config file missing: {config_path}")
-        if not os.path.exists(weights_path):
-            raise FileNotFoundError(f"Registered weights file missing: {weights_path}")
+        if not os.path.exists(config_path) or not os.path.exists(weights_path):
+            auto_entry = self._auto_discover_model(model_id)
+            if auto_entry:
+                config_path = auto_entry["config_path"]
+                weights_path = auto_entry["weights_path"]
+            else:
+                raise FileNotFoundError(f"Missing weights or config for '{model_id}'.")
 
         print(f"[ModelRegistry] Loading '{model_id}' onto {device.upper()}...")
         
