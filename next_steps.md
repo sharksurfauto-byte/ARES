@@ -1,13 +1,13 @@
-# ARES-Orion: Hierarchical Reliability Roadmap & Next Steps
+# ARES-Orion (Phase 3): Locked Technical Specification & Execution Roadmap
 
-This document outlines the revised architecture and execution roadmap for the **ARES (Adaptive Reliable Expert System)** framework. ARES models reliability as a two-tier hierarchy: **Global (Prompt-Level)** and **Local (Token-Level)**.
+This document outlines the locked, implementation-ready specification for **ARES-Orion (Phase 3)** incorporating all 12 scientific refinements.
 
 ---
 
-## 1. Unified Research Hypothesis & Framing
+## 1. Central Research Question
 
-> **Core Research Hypothesis**:
-> *"Reliability should be estimated hierarchically—first at the prompt level to guide global compute allocation (GRM), and then at the token level to guide local expert selection inside an MoE topology (LRM)."*
+> **Central Hypothesis**:
+> *"Can calibrated predictions of expert-specific token reliability improve sparse MoE routing beyond conventional representation-based gating, while preserving computational efficiency and load balance?"*
 
 ```text
                         ┌──────────────────────────────┐
@@ -15,91 +15,111 @@ This document outlines the revised architecture and execution roadmap for the **
                         └──────────────┬───────────────┘
                                        │
   =====================================▼=====================================
-  GLOBAL RELIABILITY MODULE (GRM)  [Prompt-Level Assessment]
+  GLOBAL RELIABILITY MODULE (GRM)  [Macro Policy Layer]
   ===========================================================================
-                                       │
-                         Last Prompt Token Activation
-                                       │
-                           Global Probe (MLP / Linear)
                                        │
                          Global Reliability Score (R_global)
                                        │
                       ┌────────────────┴────────────────┐
                       ▼                                 ▼
-            High Reliability (R_global > τ)   Low Reliability (R_global ≤ τ)
-            (Fast Path / Base Compute)        (Activate MoE / High Compute)
+            High Reliability (R_global ≥ τ)   Low Reliability (R_global < τ)
+            (Fast Path / Base Compute)        (Activate Orion MoE Pipeline)
                                                         │
   ======================================================▼====================
-  LOCAL RELIABILITY MODULE (LRM)   [Token-Level MoE Routing]
+  LOCAL RELIABILITY MODULE (LRM / Orion) [Micro Token Routing]
   ===========================================================================
                                                         │
                                                  Decoding Step t
                                                         │
                                             Token Hidden State h_t
                                                         │
-                                           Expert Reliability Vector R_local(t)
+                         ┌──────────────────────────────┴──────────────────────────────┐
+                         ▼                                                             ▼
+             [ Baseline Router W_r ]                                       [ LRM Reliability Probing ]
+           (Feature-Space Alignment)                                       h_t ──► Probe 1 ──► r_1 = P(correct | E_1)
+                         │                                                 h_t ──► Probe 2 ──► r_2 = P(correct | E_2)
+                         │                                                 h_t ──► Probe 3 ──► r_3 = P(correct | E_3)
+                         │                                                 h_t ──► Probe 4 ──► r_4 = P(correct | E_4)
+                         │                                                             │
+                         └──────────────────────────────┬──────────────────────────────┘
+                                                        ▼
+                                           [ Calibrated Gating Score ]
+                                     S_e(t) = W_{r,e} h_t + λ log(r_e / (1 - r_e))
                                                         │
-                                              MoE Reliability Router
-                                                        │
-                                                Selected Expert(s)
+                                                        ▼
+                                              Selected Top-1 Expert
                                                         │
                                                     Next Token
 ```
 
 ---
 
-## 2. Component Definitions
+## 2. Experimental Controls & Causal Design
 
-### A. Global Reliability Module (GRM)
-*   **Inspection Point**: Hidden state of the final prompt token ($x_{\text{prompt\_end}}$) before output generation begins.
-*   **Output**: Scalar **Global Reliability Score** $R_{\text{global}} \in [0, 1]$.
-*   **Action**: Determines macro-level compute allocation:
-    *   $R_{\text{global}} \ge 0.85$: High confidence $\rightarrow$ Direct execution on lightweight base model (low compute, zero routing overhead).
-    *   $R_{\text{global}} < 0.85$: High risk $\rightarrow$ Route prompt to the full ARES-Orion MoE pipeline.
+To ensure zero reviewer objections regarding capacity scaling or expert quality variance:
 
-### B. Local Reliability Module (LRM)
-*   **Inspection Point**: Intermediate layer hidden states ($h_t^{(l)}$) at each autoregressive decoding step $t$.
-*   **Output**: **Expert Reliability Vector** $\mathbf{R}_{\text{local}}(t) = [r_1, r_2, \dots, r_K]$, where $r_e \in [0, 1]$ represents the predicted correctness probability of Expert $e$ for token $t$.
-*   **Action**: Determines micro-level token routing inside the sparse MoE layer.
+1.  **Identical Expert Initialization**: All $K=4$ experts are initialized from the same frozen ARES-Base checkpoint.
+2.  **Identical Training Budget**: Each expert is trained for the exact same number of tokens, steps, optimizer parameters, and learning rate schedule on its domain partition subset.
+3.  **Frozen Expert Pool**: During router evaluation, **the expert pool is strictly frozen**. Performance differences between routers are 100% causally attributable to **gating intelligence**.
 
 ---
 
-## 3. Phase 2.5: Experimental Validation & Controls (COMPLETED)
-
-Phase 2.5 validation is **complete**. The empirical results confirm:
+## 3. The 3-Way Controlled Router Ablation Suite
 
 ```text
-                           [ Phase 2.5 Empirical Findings ]
-                                          │
-       ┌───────────────────────┬──────────┴───────────┬───────────────────────┐
-       ▼                       ▼                      ▼                       ▼
-   Layer Emergence        OOD Transfer Gap        Selectivity            Calibration
- Monotonic L10 Peak     GRM (0.50) vs LRM (0.72)  +18.5% Passed           ECE < 0.02
+                              [ Frozen Expert Pool (K=4) ]
+                                           │
+             ┌─────────────────────────────┼─────────────────────────────┐
+             ▼                             ▼                             ▼
+       [ Baseline A ]                [ Baseline B ]                 [ Proposed ]
+     Standard Switch MoE          Semantic Affinity MoE        ARES-Orion Reliability MoE
+   (Dot-product gating)           (Domain centroid gating)     (Calibrated probe gating)
 ```
 
-1.  **Monotonic Emergence**: LRM MLP AUROC rises monotonically from Layer 0 (`0.6865`) to Layer 10 (`0.7713`).
-2.  **OOD Transfer Gap**: GRM (Prompt-level) achieves `0.9655` ID but collapses to `0.5000` (chance) OOD on OpenWebText/WikiText. LRM (Token-level) maintains **`0.7240` OOD AUROC**, proving token-level uncertainty is domain-agnostic.
-3.  **Hewitt-Liang Control**: LRM probe accuracy drops to `51.5%` on shuffled labels (`+18.5%` selectivity), proving probes read genuine internal representations.
-4.  **Calibration**: LRM probe ECE remains under **`0.015` – `0.022`** across all seeds.
+1.  **Baseline A (Standard Switch MoE)**: $S_e(t) = \mathbf{W}_{r,e}^\top h_t^{(l)}$. Standard token-choice routing.
+2.  **Baseline B (Semantic Affinity MoE)**: $S_e(t) = \text{CosineSimilarity}(h_t^{(l)}, \mathbf{C}_e)$, where $\mathbf{C}_e$ is Expert $e$'s domain centroid.
+3.  **Proposed (ARES-Orion MoE)**:
+    $$S_e(t) = \mathbf{W}_{r,e}^\top h_t^{(l)} + \lambda \cdot \log\left(\frac{r_e(t) + \epsilon}{1 - r_e(t) + \epsilon}\right)$$
+    where $r_e(t) = P(\text{Expert } e \text{ predicts target token correctly} \mid h_t^{(l)})$.
 
 ---
 
-## 4. Phase 3: ARES-Orion MoE Controlled Ablations
+## 4. Evaluation Suite & Metrics
 
-In Phase 3, we construct a 3-way ablation to evaluate downstream performance, FLOP savings, and latency:
+### Primary Model Metrics
+*   **Token Prediction Failure Rate**: Fraction of generated tokens where model prediction fails.
+*   **Perplexity (PPL)**: Language modeling quality on ID (`tinystories`) and OOD (`wikitext`, `openwebtext`).
+*   **Expected Calibration Error (ECE) & Brier Score**: Routing decision calibration.
+*   **Expert Selection Regret (Oracle Gap)**:
+    $$\text{Regret} = 1 - \frac{\text{Accuracy}_{\text{selected expert}}}{\text{Accuracy}_{\text{oracle best expert}}}$$
+
+### System & Compute Metrics
+*   **Inference Latency & Throughput**: Milliseconds per token, tokens per second.
+*   **Total FLOPs per Sequence**: Computational cost per generated sequence.
+*   **Routing Gini Index & Entropy**: Measure of expert load balancing.
+
+---
+
+## 5. Implementation Roadmap (4 Execution Steps)
 
 ```text
-                              [ Fixed Expert Pool ]
-                                        │
-             ┌──────────────────────────┼──────────────────────────┐
-             ▼                          ▼                          ▼
-       [ Router 1 ]                [ Router 2 ]               [ Router 3 ]
-       Standard Gating            Semantic Affinity       ARES-Orion Hierarchical
-       (Switch MoE)               (Domain-Only)           (GRM + LRM Reliability)
+[ Step 1: Expert Pool Construction ] ──► [ Step 2: Expert Failure Data Extraction ]
+                                                              │
+                                                              ▼
+[ Step 4: Full Pareto Benchmark ]  ◄─── [ Step 3: Probe & Router Training ]
 ```
 
-### Metrics Suite for MoE Evaluation
-*   **Downstream Accuracy & Perplexity**: WikiText-103 PPL, GSM8K reasoning accuracy.
-*   **Compute Efficiency**: Total FLOPs per sequence, inference latency (ms/token).
-*   **Calibration & Reliability**: Expected Calibration Error (ECE), Brier score.
-*   **Expert Load Balance**: Routing Gini coefficient, routing entropy.
+### Step 1: Expert Pool Construction (`ares_moe/`)
+*   Build `ARESMoELayer` module supporting $K=4$ parallel FFN experts inserted at Layers 4, 8, and 11.
+*   Fine-tune Expert 1–4 from ARES-Base on domain splits with identical hyperparameter budgets.
+
+### Step 2: Expert Failure Dataset Collection
+*   Pass sequences through each individual Expert $e$ to collect expert-specific activation states $h_t$ and binary token correctness labels $Y_{e, \text{correct}}$.
+
+### Step 3: Reliability Probe & Router Joint Training
+*   Train 4 MLP probes $f_{\theta, e}(h_t)$ to predict $r_e(t)$.
+*   Train gating router weights $\mathbf{W}_r$ with auxiliary load-balancing loss + reliability logit augmentation.
+*   Run $\lambda$ parameter sweep across $\lambda \in \{0.0, 0.1, 0.25, 0.5, 1.0, 2.0\}$.
+
+### Step 4: Full System Evaluation
+*   Evaluate Baseline A, Baseline B, and ARES-Orion across the metrics suite.

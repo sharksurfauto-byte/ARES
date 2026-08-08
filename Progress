@@ -128,3 +128,16 @@ A literature search (arXiv, Semantic Scholar) verifies that ARES possesses a str
 2.  **Universal Token Reliability**: LRM (Token-Level) maintains **`0.7240` AUROC on OpenWebText** and **`0.6970` on WikiText** with **`ECE < 0.02`**, proving token-level uncertainty represents domain-agnostic language mechanics.
 3.  **Passed Hewitt-Liang Control**: LRM probe accuracy drops to `51.5%` on shuffled labels (selectivity `+18.5%`), proving the probe reads learned representations rather than token frequency shortcuts.
 4.  **Core Paper Takeaway**: *"Prompt-level cascades overfit to domain distribution (OOD AUROC 0.50), whereas token-level MoE routing (ARES-Orion) decodes universal reliability signals that generalize zero-shot across domains (OOD AUROC 0.724)."*
+
+---
+
+## 9. Phase 3 Initiation: ARES-Orion MoE Technical Specification (LOCKED)
+**Initiated August 2026**: Formulated locked architectural specification incorporating all 12 scientific refinements:
+*   **Central Hypothesis**: *"Can calibrated predictions of expert-specific token reliability improve sparse MoE routing beyond conventional representation-based gating, while preserving computational efficiency and load balance?"*
+*   **Target Topology**: 12-layer Pre-LN Transformer with sparse MoE blocks inserted at Layers 4, 8, and 11 ($K=4$ experts).
+*   **Causal Experimental Controls**: Experts 1–4 are trained from the same base checkpoint with identical hyperparameter budgets and **frozen during router comparison**.
+*   **3-Way Controlled Router Ablation Suite**:
+    1.  *Baseline A (Standard Switch MoE)*: $S_e(t) = \mathbf{W}_{r,e}^\top h_t^{(l)}$ (Dot-product gating).
+    2.  *Baseline B (Semantic Affinity)*: $S_e(t) = \text{CosineSimilarity}(h_t^{(l)}, \mathbf{C}_e)$ (Domain centroid gating).
+    3.  *Proposed (ARES-Orion MoE)*: $S_e(t) = \mathbf{W}_{r,e}^\top h_t^{(l)} + \lambda \cdot \log\left(\frac{r_e(t) + \epsilon}{1 - r_e(t) + \epsilon}\right)$ (Probe-calibrated gating).
+*   **New Key Metrics**: Expert Selection Regret (Oracle Gap), Token Prediction Failure Rate, $\lambda$ Parameter Sweep ($\lambda \in [0.0, 2.0]$).
