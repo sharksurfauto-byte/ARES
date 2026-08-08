@@ -45,6 +45,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from tokenizer import get_tokenizer
 from ares_datasets import get_dataset
 from models.registry import ModelRegistry
+from utils.hooks import HookRegistry
 from ares_moe.moe_layer import ARESMoELayer, prepare_model_for_multi_gpu
 from scripts.train_ares_orion_router import compute_ece, evaluate_probe_metrics, ExpertReliabilityProbe
 
@@ -53,6 +54,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate ARES-Orion 3-Way Controlled Router Ablation")
     parser.add_argument("--model-id", type=str, required=True, help="Registered Model ID")
     parser.add_argument("--registry-path", type=str, default="models/registry.json", help="Registry path")
+    parser.add_argument("--probe-dir", type=str, default="experiments/orion_router_results", help="Directory where probes are saved")
     parser.add_argument("--id-dataset", type=str, default="tinystories", help="In-distribution dataset")
     parser.add_argument("--ood-datasets", type=str, default="wikitext,openwebtext", help="Comma-separated OOD dataset names")
     parser.add_argument("--moe-layers", type=str, default="4,8,11", help="MoE insertion layers")
@@ -70,7 +72,7 @@ def benchmark_router_performance(
     hidden_states: torch.Tensor,
     probe_reliabilities: Optional[torch.Tensor],
     targets: torch.Tensor
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """
     Evaluates a specific router mode on a batch of hidden states and targets.
     """
@@ -83,10 +85,14 @@ def benchmark_router_performance(
     tokens_processed = hidden_states.shape[0] * hidden_states.shape[1]
     throughput_tps = tokens_processed / max(1e-6, (end_time - start_time))
 
+    gini_val = metrics["gini_index"].mean().item() if isinstance(metrics["gini_index"], torch.Tensor) else float(metrics["gini_index"])
+    entropy_val = metrics["routing_entropy"].mean().item() if isinstance(metrics["routing_entropy"], torch.Tensor) else float(metrics["routing_entropy"])
+
     return {
-        "aux_loss": float(aux_loss.cpu()),
-        "gini_index": metrics["gini_index"],
-        "routing_entropy": metrics["routing_entropy"],
+        "out_states": out_states,
+        "aux_loss": float(aux_loss.mean().item()),
+        "gini_index": gini_val,
+        "routing_entropy": entropy_val,
         "latency_ms": latency_ms,
         "throughput_tps": throughput_tps
     }
@@ -117,6 +123,41 @@ def main():
     tokenizer = get_tokenizer("gpt2-bpe")
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     max_seq_len = raw_model.config.max_position_embeddings
+    H_dim = raw_model.config.hidden_size
+
+    # Setup HookRegistry for layer hidden state extraction
+    hooks = HookRegistry()
+    captured_activations: Dict[int, torch.Tensor] = {}
+
+    def save_activation_callback(payload):
+        l_idx = payload.get("layer_idx")
+        if l_idx in moe_layers:
+            captured_activations[l_idx] = payload["block_output"].detach()
+
+    hooks.register("after_block", save_activation_callback)
+
+    # 3. Load Trained Reliability Probes for Layer 4
+    probe_dir = Path(args.probe_dir)
+    probes: List[ExpertReliabilityProbe] = []
+    probes_loaded = False
+
+    if probe_dir.exists():
+        loaded_probes = []
+        for e_idx in range(K):
+            p_file = probe_dir / f"probe_layer_{moe_layers[0]}_expert_{e_idx}.pt"
+            if p_file.exists():
+                p = ExpertReliabilityProbe(input_dim=H_dim, hidden_dim=256).to(device)
+                p.load_state_dict(torch.load(p_file, map_location=device))
+                p.eval()
+                loaded_probes.append(p)
+        if len(loaded_probes) == K:
+            probes = loaded_probes
+            probes_loaded = True
+            print(f"[ARES-Orion] Successfully loaded {K} trained expert probes for layer {moe_layers[0]}.")
+
+    if not probes_loaded:
+        print(f"[ARES-Orion] Probes not found in '{probe_dir}'. Using fallback probe initialization.")
+        probes = [ExpertReliabilityProbe(input_dim=H_dim, hidden_dim=256).to(device) for _ in range(K)]
 
     datasets_to_eval = [args.id_dataset] + [x.strip() for x in args.ood_datasets.split(",") if x.strip()]
     eval_results = {}
@@ -152,17 +193,22 @@ def main():
             test_moe_layer = ARESMoELayer(
                 num_experts=K,
                 top_k=1,
-                hidden_size=raw_model.config.hidden_size,
-                intermediate_size=getattr(raw_model.config, "intermediate_size", raw_model.config.hidden_size * 4),
+                hidden_size=H_dim,
+                intermediate_size=getattr(raw_model.config, "intermediate_size", H_dim * 4),
                 lambda_rel=r_lam,
                 router_mode=r_mode
             ).to(device)
+            
+            # Load trained router gate weights if available
+            gate_file = probe_dir / f"router_gate_layer_{moe_layers[0]}.pt"
+            if gate_file.exists():
+                test_moe_layer.gate.load_state_dict(torch.load(gate_file, map_location=device))
+
             test_moe_layer.eval()
 
             total_tokens = 0
             total_correct = 0
             total_latency_ms = 0.0
-            total_aux_loss = 0.0
             gini_list = []
             entropy_list = []
 
@@ -173,32 +219,51 @@ def main():
                     if T < 2:
                         continue
 
-                    shift_targets = input_ids[:, 1:].cpu()
+                    shift_targets = input_ids[:, 1:].to(device)
 
-                    # Base model forward pass
-                    outputs = raw_model(input_ids, output_hidden_states=True)
-                    hidden_l4 = outputs[1][moe_layers[0]][:, :-1, :] # (B, T-1, H)
+                    # Base model forward pass with hooks
+                    captured_activations.clear()
+                    logits, _, _ = raw_model(input_ids, hooks=hooks)
 
-                    # Dummy probe reliabilities for synthetic verification test
-                    dummy_rel = torch.full((B, T-1, K), 0.75, device=device) if r_mode == "ares_orion" else None
+                    if moe_layers[0] not in captured_activations:
+                        continue
+
+                    hidden_l4 = captured_activations[moe_layers[0]][:, :-1, :] # (B, T-1, H)
+
+                    # Compute real-time probe reliabilities for ARES-Orion
+                    if r_mode == "ares_orion":
+                        rel_list = [p(hidden_l4) for p in probes]
+                        probe_rel = torch.stack(rel_list, dim=-1) # (B, T-1, K)
+                    else:
+                        probe_rel = None
 
                     # Benchmark MoE execution
-                    res = benchmark_router_performance(test_moe_layer, hidden_l4, dummy_rel, shift_targets)
+                    res = benchmark_router_performance(test_moe_layer, hidden_l4, probe_rel, shift_targets)
+
+                    # Evaluate next-token prediction accuracy on LM head
+                    moe_out = res["out_states"]
+                    moe_logits = raw_model.lm_head(moe_out)
+                    preds = torch.argmax(moe_logits, dim=-1)
+                    
+                    correct = (preds == shift_targets).sum().item()
+                    total_correct += correct
 
                     total_latency_ms += res["latency_ms"]
-                    total_aux_loss += res["aux_loss"]
                     gini_list.append(res["gini_index"])
                     entropy_list.append(res["routing_entropy"])
                     total_tokens += B * (T - 1)
 
-            avg_gini = float(np.mean(gini_list))
-            avg_entropy = float(np.mean(entropy_list))
+            avg_gini = float(np.mean(gini_list)) if gini_list else 0.0
+            avg_entropy = float(np.mean(entropy_list)) if entropy_list else 0.0
             avg_latency = total_latency_ms / max(1, len(dataloader))
             avg_tps = total_tokens / max(1e-6, (total_latency_ms / 1000.0))
+            token_acc = total_correct / max(1, total_tokens)
 
             d_records[r_label] = {
                 "router_mode": r_mode,
                 "lambda_rel": r_lam,
+                "token_accuracy": token_acc,
+                "failure_rate": 1.0 - token_acc,
                 "total_tokens_evaluated": total_tokens,
                 "avg_latency_ms_per_batch": avg_latency,
                 "throughput_tokens_per_sec": avg_tps,
@@ -206,6 +271,7 @@ def main():
                 "avg_routing_entropy": avg_entropy
             }
 
+            print(f"   ├─ Token Accuracy:    {token_acc*100:.2f}%")
             print(f"   ├─ Throughput:        {avg_tps:,.1f} tokens/sec")
             print(f"   ├─ Batch Latency:     {avg_latency:.2f} ms")
             print(f"   ├─ Gini Index:        {avg_gini:.4f} (0=balanced, 1=collapsed)")
@@ -215,12 +281,12 @@ def main():
 
     # Print Final Comparative Summary Table
     print("\n" + "=" * 115)
-    print(f" {'Dataset':<15} | {'Router Variant':<30} | {'Throughput (tok/s)':<20} | {'Gini Index':<15} | {'Routing Entropy':<15}")
+    print(f" {'Dataset':<15} | {'Router Variant':<30} | {'Token Acc':<12} | {'Throughput (tok/s)':<20} | {'Gini Index':<12}")
     print("=" * 115)
     
     for d_name, d_dict in eval_results.items():
         for r_label, r_stats in d_dict.items():
-            print(f" {d_name:<15} | {r_label:<30} | {r_stats['throughput_tokens_per_sec']:<20,.1f} | {r_stats['avg_gini_index']:<15.4f} | {r_stats['avg_routing_entropy']:<15.4f}")
+            print(f" {d_name:<15} | {r_label:<30} | {r_stats['token_accuracy']*100:<12.2f}% | {r_stats['throughput_tokens_per_sec']:<20,.1f} | {r_stats['avg_gini_index']:<12.4f}")
         print("-" * 115)
 
     # Save Evaluation JSON

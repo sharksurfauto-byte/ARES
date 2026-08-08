@@ -35,7 +35,6 @@ except ImportError:
     raise ImportError("Please install scikit-learn: pip install scikit-learn")
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from ares_moe.moe_layer import prepare_model_for_multi_gpu
 
 
 # ============================================================================
@@ -126,6 +125,35 @@ def train_probe_model(
             optimizer.step()
 
 
+def train_router_gate(
+    router_gate: nn.Module,
+    X_train: torch.Tensor,
+    Y_train_mat: torch.Tensor,
+    device: str,
+    epochs: int = 3,
+    batch_size: int = 512,
+    lr: float = 1e-3
+) -> None:
+    """Trains the base Switch MoE Router Gating weights (W_r) on best expert targets."""
+    router_gate.to(device)
+    optimizer = torch.optim.Adam(router_gate.parameters(), lr=lr)
+    loss_fn = nn.CrossEntropyLoss()
+
+    best_expert_targets = torch.argmax(Y_train_mat, dim=1).long()
+    dataset = TensorDataset(X_train, best_expert_targets)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    for epoch in range(epochs):
+        router_gate.train()
+        for batch_x, batch_y in loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            optimizer.zero_grad()
+            logits = router_gate(batch_x)
+            loss = loss_fn(logits, batch_y)
+            loss.backward()
+            optimizer.step()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train ARES-Orion Joint Probe & Router Suite")
     parser.add_argument("--data-dir", type=str, default="data/expert_probe_data", help="Directory where expert tensors are saved")
@@ -190,7 +218,7 @@ def main():
         Y_tr_mat, Y_val_mat = Y_matrix[tr_idx], Y_matrix[val_idx]
 
         # 2. Train Expert-Specific Reliability Probes (r_1, r_2, r_3, r_4)
-        print(f"\n[1/3] Training {K} Expert Reliability Probes (MLP)...")
+        print(f"\n[1/4] Training {K} Expert Reliability Probes (MLP)...")
         probes: List[ExpertReliabilityProbe] = []
         val_probe_reliabilities = []
 
@@ -204,6 +232,10 @@ def main():
             probe.eval()
             probes.append(probe)
 
+            # Save Probe Weights to Disk for Step 4 Evaluation
+            probe_weight_file = out_path / f"probe_layer_{layer_idx}_expert_{e_idx}.pt"
+            torch.save(probe.state_dict(), probe_weight_file)
+
             # Evaluate Probe on Val Set
             with torch.no_grad():
                 r_e_val = probe(X_val.to(args.device)).cpu().numpy()
@@ -215,20 +247,27 @@ def main():
         # Stack predicted reliabilities for validation set: (N_val, K)
         R_val_matrix = torch.tensor(np.column_stack(val_probe_reliabilities)).float()
 
-        # 3. Compute Oracle Best Expert Benchmark & Expert Selection Regret
+        # 3. Train Base Switch MoE Router Gate W_r
+        print(f"\n[2/4] Fitting Base Switch MoE Router Gating Weights W_r...")
+        router_gate = nn.Linear(H, K, bias=False).to(args.device)
+        train_router_gate(router_gate, X_tr, Y_tr_mat, args.device, epochs=3, batch_size=args.batch_size)
+        router_gate.eval()
+
+        # Save Trained Router Gate Weights to Disk
+        gate_file = out_path / f"router_gate_layer_{layer_idx}.pt"
+        torch.save(router_gate.state_dict(), gate_file)
+
+        # 4. Compute Oracle Best Expert Benchmark & Expert Selection Regret
         oracle_best_expert = torch.argmax(Y_val_mat, dim=1).numpy()
         oracle_accuracy = float(torch.max(Y_val_mat, dim=1)[0].float().mean())
         
-        print(f"\n[2/3] Oracle Expert Upper Bound Accuracy: {oracle_accuracy * 100:.2f}%")
+        print(f"\n[3/4] Oracle Expert Upper Bound Accuracy: {oracle_accuracy * 100:.2f}%")
 
-        # 4. Execute Lambda Sweep (Router Gating Evaluation)
-        print(f"\n[3/3] Running Lambda Reliability Sweep (λ ∈ {lambda_sweep})...")
-        
-        # Initialize Router Weights W_r
-        router_gate = nn.Linear(H, K, bias=False).to(args.device)
-        nn.init.kaiming_uniform_(router_gate.weight, a=math.sqrt(5))
+        # 5. Execute Lambda Sweep (Router Gating Evaluation)
+        print(f"\n[4/4] Running Lambda Reliability Sweep (λ ∈ {lambda_sweep})...")
 
         layer_sweep_records = {}
+        N_val = len(val_idx)
 
         for lam in lambda_sweep:
             with torch.no_grad():
@@ -244,8 +283,9 @@ def main():
                 # Top-1 Router Decision
                 selected_expert = torch.argmax(final_logits, dim=1) # (N_val,)
 
-                # Selected Expert Accuracy
-                actual_correctness = Y_val_mat[torch.arange(len(val_idx)), selected_expert].float()
+                # Selected Expert Accuracy (Ensure indexing tensors are on the same device)
+                row_indices = torch.arange(N_val)
+                actual_correctness = Y_val_mat[row_indices, selected_expert].float()
                 selected_accuracy = float(actual_correctness.mean())
 
                 # Expert Selection Regret (Oracle Gap)
@@ -253,7 +293,7 @@ def main():
 
                 # Expert Load Balancing (Gini Index & Routing Entropy)
                 counts = torch.bincount(selected_expert, minlength=K).float()
-                fracs = counts / len(val_idx)
+                fracs = counts / max(1.0, float(N_val))
                 sorted_fracs, _ = torch.sort(fracs)
                 idx_vec = torch.arange(1, K + 1).float()
                 gini = float(((2 * idx_vec - K - 1) * sorted_fracs).sum() / (K * sorted_fracs.sum() + 1e-8))
