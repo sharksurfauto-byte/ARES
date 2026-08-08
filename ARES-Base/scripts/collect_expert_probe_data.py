@@ -66,10 +66,10 @@ def main():
 
     print(f"\n[2/4] Streaming dataset '{args.dataset}' split '{args.split}'...")
     dataset=get_dataset(
-        dataset_name==args.dataset,
+        dataset_name=args.dataset,
         tokenizer=tokenizer,
         max_seq_length=max_seq_len,
-        aplit=args.split,
+        split=args.split,
         max_examples=args.max_examples
     )
 
@@ -86,7 +86,7 @@ def main():
         num_experts=K,
         top_k=1,
         hidden_size=raw_model.config.hidden_size,
-        intermediate_size=raw_model.config.intermediate_size
+        intermediate_size=getattr(raw_model.config, "intermediate_size", raw_model.config.hidden_size * 4)
     ).to(device)
     sample_moe_layer.eval()
 

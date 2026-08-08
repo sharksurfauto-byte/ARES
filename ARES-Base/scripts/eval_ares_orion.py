@@ -153,7 +153,7 @@ def main():
                 num_experts=K,
                 top_k=1,
                 hidden_size=raw_model.config.hidden_size,
-                intermediate_size=raw_model.config.intermediate_size,
+                intermediate_size=getattr(raw_model.config, "intermediate_size", raw_model.config.hidden_size * 4),
                 lambda_rel=r_lam,
                 router_mode=r_mode
             ).to(device)
