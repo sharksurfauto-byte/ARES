@@ -34,46 +34,45 @@ class ModelRegistry:
 
     def _auto_discover_model(self, model_id: str) -> Optional[Dict[str, Any]]:
         """Automatically searches local and Kaggle input directories for model weights and configs."""
+        base_dir = Path(__file__).resolve().parent.parent
+        
         search_dirs = [
-            Path("experiments") / model_id,
+            base_dir / "experiments",
             Path("experiments"),
-            Path("configs"),
             Path("/kaggle/input"),
+            Path("."),
         ]
         
         found_weights = None
-        found_config = None
         
-        # 1. Search for best_model.pt
+        # 1. Search for best_model.pt or any .pt file
         for d in search_dirs:
             if not d.exists():
                 continue
             if d.is_file() and d.name.endswith(".pt"):
                 found_weights = d
                 break
-            for p in d.glob("**/best_model.pt"):
-                found_weights = p
+            best_pts = list(d.glob("**/best_model.pt"))
+            if best_pts:
+                found_weights = best_pts[0]
                 break
-            if found_weights:
+            any_pts = list(d.glob("**/*.pt"))
+            if any_pts:
+                found_weights = any_pts[0]
                 break
-                
-        # 2. Search for config YAML
-        config_candidates = [
-            Path("configs/ares_base_v1.0.yaml"),
-            Path("configs/config.yaml"),
-        ]
-        for d in search_dirs:
-            if not d.exists():
-                continue
-            for p in d.glob("**/*.yaml"):
-                config_candidates.append(p)
-                
-        for c in config_candidates:
-            if c.exists():
-                found_config = c
-                break
-                
-        if found_weights and found_config:
+
+        # 2. Config defaults to configs/ares_base_v1.0.yaml
+        found_config = base_dir / "configs" / "ares_base_v1.0.yaml"
+        if not found_config.exists():
+            for d in search_dirs:
+                if not d.exists():
+                    continue
+                yamls = list(d.glob("**/*.yaml"))
+                if yamls:
+                    found_config = yamls[0]
+                    break
+
+        if found_weights and found_config and found_config.exists():
             print(f"[ModelRegistry] Auto-discovered checkpoint '{found_weights}' and config '{found_config}' for '{model_id}'!")
             entry = {
                 "model_id": model_id,
@@ -90,6 +89,8 @@ class ModelRegistry:
             catalog["models"][model_id] = entry
             self._save_catalog(catalog)
             return entry
+            
+        print(f"[ModelRegistry] Auto-discovery search complete. Found weights: {found_weights}, Found config: {found_config}")
         return None
 
     def register_model(
@@ -177,7 +178,7 @@ class ModelRegistry:
                 config_path = auto_entry["config_path"]
                 weights_path = auto_entry["weights_path"]
             else:
-                raise FileNotFoundError(f"Missing weights or config for '{model_id}'.")
+                raise FileNotFoundError(f"Missing weights or config for '{model_id}'. Config: {config_path}, Weights: {weights_path}")
 
         print(f"[ModelRegistry] Loading '{model_id}' onto {device.upper()}...")
         
