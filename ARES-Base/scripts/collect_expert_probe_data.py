@@ -147,8 +147,8 @@ def main():
                 for e_idx in range(K):
                     expert = sample_moe_layer.experts[e_idx]
                     
-                    # Forward pass through Expert e FFN block
-                    expert_ffn_out = expert(layer_h) # (B, T-1, H)
+                    # Forward pass through Expert e FFN block with Transformer residual addition
+                    expert_ffn_out = layer_h + expert(layer_h) # (B, T-1, H)
                     
                     # Compute token logits using base model LM Head directly on GPU
                     expert_logits = raw_model.lm_head(expert_ffn_out) # (B, T-1, Vocab) on GPU

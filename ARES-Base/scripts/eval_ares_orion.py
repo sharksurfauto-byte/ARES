@@ -240,8 +240,8 @@ def main():
                     # Benchmark MoE execution
                     res = benchmark_router_performance(test_moe_layer, hidden_l4, probe_rel, shift_targets)
 
-                    # Evaluate next-token prediction accuracy on LM head
-                    moe_out = res["out_states"]
+                    # Evaluate next-token prediction accuracy on LM head with residual connection
+                    moe_out = hidden_l4 + res["out_states"] # (B, T-1, H)
                     moe_logits = raw_model.lm_head(moe_out)
                     preds = torch.argmax(moe_logits, dim=-1)
                     
