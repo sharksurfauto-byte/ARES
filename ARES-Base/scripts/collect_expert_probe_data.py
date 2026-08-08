@@ -127,7 +127,7 @@ def main():
             
             if T < 2:
                 continue
-            shift_targets = input_ids[:, 1:].cpu() # Target tokens (B, T-1)
+            shift_targets_gpu = input_ids[:, 1:] # Target tokens (B, T-1) on GPU
 
             # Clear previous batch activations & run model forward pass with hooks
             captured_activations.clear()
@@ -143,19 +143,19 @@ def main():
                 flat_h = layer_h.reshape(-1, H_dim) # (N, H)
                 collected_hidden_states[layer_idx].append(flat_h.cpu())
 
-                # Evaluate each Expert sub-network on flat_h
+                # Evaluate each Expert sub-network on flat_h directly on GPU
                 for e_idx in range(K):
                     expert = sample_moe_layer.experts[e_idx]
                     
                     # Forward pass through Expert e FFN block
                     expert_ffn_out = expert(layer_h) # (B, T-1, H)
                     
-                    # Compute token logits using base model LM Head
-                    expert_logits = raw_model.lm_head(expert_ffn_out).cpu() # (B, T-1, Vocab)
-                    expert_preds = torch.argmax(expert_logits, dim=-1) # (B, T-1)
+                    # Compute token logits using base model LM Head directly on GPU
+                    expert_logits = raw_model.lm_head(expert_ffn_out) # (B, T-1, Vocab) on GPU
+                    expert_preds = torch.argmax(expert_logits, dim=-1) # (B, T-1) on GPU
                     
                     # Expert Correctness Label: 1 if Expert e correctly predicts target token, 0 if fail
-                    expert_correct = (expert_preds == shift_targets).long().reshape(-1) # (N,)
+                    expert_correct = (expert_preds == shift_targets_gpu).long().reshape(-1).cpu() # (N,)
                     collected_expert_labels[layer_idx][e_idx].append(expert_correct)
 
             total_tokens_collected += (T - 1) * B
